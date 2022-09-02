@@ -65,12 +65,14 @@ class PrimaryKeyError(RowError):
     description = "Values in the primary key fields should be unique for every row"
     template = 'Row at position "{rowNumber}" violates the primary key: {note}'
 
+
 @attrs.define(kw_only=True)
 class ForeignKeyError(TableError):
     type = "foreign-key"
     title = "ForeignKey Error"
     description = "Values in the foreign key fields should exist in the reference table"
     template = 'Row at position "{rowNumber}" violates the foreign key: {note}'
+    tags = ["#table", "#row"]
 
     cells: List[str]
     """NOTE: add docs"""
@@ -91,7 +93,9 @@ class ForeignKeyError(TableError):
     """NOTE: add docs"""
 
     @classmethod
-    def from_row(cls, row, *, target_keys,  source_keys, source_name, missing_values, note):
+    def from_row(
+        cls, row, *, target_keys, source_keys, source_name, missing_values, note
+    ):
         """Create an foreign-key-error from a row
 
         Parameters:
@@ -113,7 +117,7 @@ class ForeignKeyError(TableError):
             target_keys=target_keys,
             source_keys=source_keys,
             source_name=source_name,
-            missing_values=missing_values
+            missing_values=missing_values,
         )
 
     # Metadata
@@ -125,9 +129,10 @@ class ForeignKeyError(TableError):
             "targetKeys": {"type": "array", "items": {"type": "string"}},
             "sourceKeys": {"type": "array", "items": {"type": "string"}},
             "sourceName": {"type": "string"},
-            "missingValues": {"type": "array", "items": {"type": "string"}},
+            "missingValues": {"type": "array", "items": {"type": "integer"}},
         },
     }
+
 
 class DuplicateRowError(RowError):
     type = "duplicate-row"
