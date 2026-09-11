@@ -15,7 +15,8 @@ from ..indexer import Indexer
 from ..platform import platform
 from ..resource import Resource
 from ..system import system
-from ..table import Header, Lookup, Row, Table
+from ..table import Header, Lookup, Row, Table, create_cell_handlers
+from ..table import fields_match as fields_match_module
 from ..transformer import Transformer
 
 if TYPE_CHECKING:
@@ -211,12 +212,21 @@ class TableResource(Resource):
     def __open_header(self):
         assert self.__labels is not None
 
+        # Prepare fields match
+        declared = (
+            self.schema.fields_match if self.schema.has_defined("fields_match") else None
+        )
+        fields_match = fields_match_module.resolve(
+            declared, schema_sync=self.detector.schema_sync
+        )
+
         # Create header
         self.__header = Header(
             self.__labels,
             fields=self.schema.fields,
             row_numbers=self.dialect.header_rows,
             ignore_case=not self.dialect.header_case,
+            fields_match=fields_match,
         )
 
         # Handle errors
@@ -233,18 +243,25 @@ class TableResource(Resource):
             # Prepare source
             source_name = fk["reference"]["resource"]
             source_key = tuple(fk["reference"]["fields"])
-            if source_name != "" and not self.package:
-                continue
-            if source_name:
+            if source_name == self.name or not source_name:
+                # Self reference
+                # A copy is needed as the resource is closed after the lookup
+                source_res = self.to_copy()
+            else:
                 if not self.package:
-                    note = 'package is required for FK: "{fk}"'
+                    note = (
+                        'package is required for foreign keys to other resources: "{fk}"'
+                    )
                     raise FrictionlessException(errors.ResourceError(note=note))
+
                 if not self.package.has_resource(source_name):
                     note = f'failed to handle a foreign key for resource "{self.name}" as resource "{source_name}" does not exist'
                     raise FrictionlessException(errors.ResourceError(note=note))
-                source_res = self.package.get_resource(source_name)
-            else:
-                source_res = self.to_copy()
+
+                # A copy is needed as the resource is closed after the lookup.
+                # Otherwise, this would cause issues in case of circular references.
+                source_res = self.package.get_resource(source_name).to_copy()
+
             if source_res.schema:
                 source_res.schema.foreign_keys = []
 
@@ -263,40 +280,37 @@ class TableResource(Resource):
                     self.__lookup[source_name][source_key].add(cells)
 
     def __open_row_stream(self):
-        # TODO: we need to rework this field_info / row code
-        # During row streaming we create a field info structure
-        # This structure is optimized and detached version of schema.fields
-        # We create all data structures in-advance to share them between rows
+        # The header knows the fields to expect in the data (in order, and
+        # accounting for schema_sync rules). The cell handlers only depend on
+        # those fields, so build them once here and reuse them for every row.
+        expected_fields: List[Field] = self.header.get_expected_fields()
+        handlers = create_cell_handlers(expected_fields)
+        expected_field_names = {field.name for field in expected_fields}
 
-        # Create field info
-        field_number = 0
-        field_info: Dict[str, Any] = {"names": [], "objects": [], "mapping": {}}
-        for field in self.schema.fields:
-            field_number += 1
-            field_info["names"].append(field.name)
-            field_info["objects"].append(field.to_copy())
-            field_info["mapping"][field.name] = (
-                field,
-                field_number,
-                field.create_cell_reader(),
-                field.create_cell_writer(),
-            )
+        primary_key_fields = set(self.schema.primary_key)
+        has_primary_key = bool(primary_key_fields) and primary_key_fields.issubset(
+            expected_field_names
+        )
 
-        # Create state
         memory_unique: Dict[str, Any] = {}
         memory_primary: Dict[Tuple[Any], Any] = {}
         foreign_groups: List[Any] = []
-        is_integrity = bool(self.schema.primary_key)
-        for field in self.schema.fields:
+        is_integrity = has_primary_key
+
+        for field in expected_fields:
             if field.constraints.get("unique"):
                 memory_unique[field.name] = {}
                 is_integrity = True
+
         if self.__lookup:
             for fk in self.schema.foreign_keys:
+                target_key = tuple(fk["fields"])
+                if not set(target_key).issubset(expected_field_names):
+                    continue
                 group = {}
                 group["sourceName"] = fk["reference"]["resource"]
                 group["sourceKey"] = tuple(fk["reference"]["fields"])
-                group["targetKey"] = tuple(fk["fields"])
+                group["targetKey"] = target_key
                 foreign_groups.append(group)
                 is_integrity = True
 
@@ -313,7 +327,7 @@ class TableResource(Resource):
 
                 row = Row(
                     cells,
-                    field_info=field_info,
+                    handlers=handlers,
                     row_number=row_number,
                 )
 
@@ -331,7 +345,7 @@ class TableResource(Resource):
                                 row.errors.append(error)
 
                 # Primary Key Error
-                if is_integrity and self.schema.primary_key:
+                if has_primary_key:
                     try:
                         cells = self.primary_key_cells(row, self.dialect.header_case)
                     except KeyError:
@@ -393,49 +407,8 @@ class TableResource(Resource):
                 # Yield row
                 yield row
 
-        if self.detector.schema_sync:
-            # Missing required labels are not included in the
-            # field_info parameter used for row creation
-            for field in self.schema.fields:
-                self.remove_missing_required_label_from_field_info(field, field_info)
-
         # Create row stream
         self.__row_stream = row_stream()
-
-    def remove_missing_required_label_from_field_info(
-        self, field: Field, field_info: Dict[str, Any]
-    ):
-        is_case_sensitive = self.dialect.header_case
-        if self.label_is_missing(
-            field.name, field_info["names"], self.labels, is_case_sensitive
-        ):
-            self.remove_field_from_field_info(field.name, field_info)
-
-    @staticmethod
-    def label_is_missing(
-        field_name: str,
-        expected_field_names: List[str],
-        table_labels: types.ILabels,
-        case_sensitive: bool,
-    ) -> bool:
-        """Check if a schema field name is missing from the TableResource
-        labels.
-        """
-        if not case_sensitive:
-            field_name = field_name.lower()
-            table_labels = [label.lower() for label in table_labels]
-            expected_field_names = [
-                field_name.lower() for field_name in expected_field_names
-            ]
-
-        return field_name not in table_labels and field_name in expected_field_names
-
-    @staticmethod
-    def remove_field_from_field_info(field_name: str, field_info: Dict[str, Any]):
-        field_index = field_info["names"].index(field_name)
-        del field_info["names"][field_index]
-        del field_info["objects"][field_index]
-        del field_info["mapping"][field_name]
 
     def primary_key_cells(self, row: Row, case_sensitive: bool) -> Tuple[Any, ...]:
         """Create a tuple containg all cells from a given row associated to primary
